@@ -9,7 +9,7 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow all origins for the live web
+    origin: "*", // Make sure this is "*" for Render deployment
     methods: ["GET", "POST"]
   }
 });
@@ -60,22 +60,30 @@ function checkWin(board, team) {
 const games = {};
 const NEXT_TURN = { 'red': 'blue', 'blue': 'green', 'green': 'red' };
 
-// Helper to send current room counts
+// Helper to broadcast lists of player names per team
 function broadcastRoomInfo(roomId) {
   const game = games[roomId];
   if (!game) return;
   
-  const counts = { red: 0, blue: 0, green: 0, total: game.players.length };
+  const roster = { red: [], blue: [], green: [], unassigned: [], total: game.players.length };
+  
   for (let socketId of game.players) {
     const team = game.teamMap[socketId];
-    if (team) counts[team]++;
+    const name = game.playerNames[socketId];
+    if (team) {
+      roster[team].push(name);
+    } else {
+      roster.unassigned.push(name);
+    }
   }
-  io.to(roomId).emit('room_info', counts);
+  io.to(roomId).emit('room_info', roster);
 }
 
 io.on('connection', (socket) => {
   
-  socket.on('join_room', (roomId) => {
+  // Step 1: User enters room code AND their name
+  socket.on('join_room', (data) => {
+    const { roomId, playerName } = data;
     socket.join(roomId);
     
     if (!games[roomId]) {
@@ -84,44 +92,52 @@ io.on('connection', (socket) => {
         turn: 'red',
         players: [],
         teamMap: {},
+        playerNames: {}, // NEW: Store player names
         deck: generateShuffledDeck(),
         hands: {},
         winner: null
       };
     }
     
+    const game = games[roomId];
+    
+    // Add player to room tracking if not already there
+    if (!game.players.includes(socket.id)) {
+      if (game.players.length >= 12) return socket.emit('error_message', 'Room is full (12 players max).');
+      game.players.push(socket.id);
+    }
+    game.playerNames[socket.id] = playerName || 'Guest';
+    
     socket.emit('room_joined', roomId);
-    broadcastRoomInfo(roomId); // Broadcast live counts to everyone in the room
+    broadcastRoomInfo(roomId); 
   });
 
+  // Step 2: User selects a team
   socket.on('join_team', (data) => {
     const { roomId, teamColor } = data;
     const game = games[roomId];
     if (!game) return;
 
-    // Check if the selected team already has 4 players
     let teamCount = 0;
     for (let p of game.players) {
       if (game.teamMap[p] === teamColor) teamCount++;
     }
     if (teamCount >= 4) return socket.emit('error_message', 'That team is already full!');
 
-    if (!game.players.includes(socket.id)) {
-      if (game.players.length >= 12) return socket.emit('error_message', 'Room is full (12 players max).');
-      
-      game.players.push(socket.id);
-      game.hands[socket.id] = game.deck.splice(0, 5);
-    }
-    
     game.teamMap[socket.id] = teamColor;
+    
+    if (!game.hands[socket.id]) {
+        game.hands[socket.id] = game.deck.splice(0, 5);
+    }
     
     socket.emit('assigned_team', teamColor);
     socket.emit('your_hand', game.hands[socket.id]);
     io.to(roomId).emit('game_state', { board: game.board, turn: game.turn, winner: game.winner });
     
-    broadcastRoomInfo(roomId); // Update counts globally after joining
+    broadcastRoomInfo(roomId); 
   });
 
+  // Step 3: Game logic
   socket.on('place_chip', (data) => {
     const { roomId, index, teamColor, playedCard } = data;
     const game = games[roomId];
@@ -160,6 +176,20 @@ io.on('connection', (socket) => {
 
       io.to(roomId).emit('game_state', { board: game.board, turn: game.turn, winner: game.winner });
       socket.emit('your_hand', playerHand);
+    }
+  });
+
+  // Clean up when a player leaves
+  socket.on('disconnect', () => {
+    for (let roomId in games) {
+      const game = games[roomId];
+      const index = game.players.indexOf(socket.id);
+      if (index !== -1) {
+        game.players.splice(index, 1);
+        delete game.teamMap[socket.id];
+        delete game.playerNames[socket.id];
+        broadcastRoomInfo(roomId);
+      }
     }
   });
 });
