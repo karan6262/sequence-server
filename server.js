@@ -97,7 +97,8 @@ function broadcastGameState(roomId) {
   io.to(roomId).emit('game_state', { 
     board: game.board, turn: game.turn, activePlayerId: activeId, activePlayerName: activeName,
     winner: game.winner, winningLine: game.winningLine, logs: game.logs, 
-    turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted 
+    turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted,
+    hostId: game.host // NEW: Sending the host ID to frontend
   });
 }
 
@@ -113,7 +114,6 @@ function broadcastRoomInfo(roomId) {
   io.to(roomId).emit('room_info', roster);
 }
 
-// core logic for placing a chip (used by humans AND bots)
 function executeMove(roomId, playerId, index, playedCard, teamColor) {
   const game = games[roomId];
   if (!game || game.winner || !game.isGameStarted) return false;
@@ -154,7 +154,6 @@ function executeMove(roomId, playerId, index, playedCard, teamColor) {
   return false;
 }
 
-// AI Bot Engine
 function triggerBotTurn(roomId) {
   const game = games[roomId];
   if (!game || !game.isGameStarted || game.winner) return;
@@ -163,14 +162,12 @@ function triggerBotTurn(roomId) {
   if (!activeId || !activeId.startsWith('bot_')) return;
 
   setTimeout(() => {
-    // Make sure it's still the bot's turn
     if (game.teamRosters[game.turn][game.teamTurnIndex[game.turn]] !== activeId) return;
 
     const hand = game.hands[activeId];
     const teamColor = game.turn;
     let moved = false;
 
-    // AI Logic: Try to play a regular card first
     for (let card of hand) {
       if (card.includes('J')) continue;
       let validIndices = BOARD_LAYOUT.map((val, idx) => val === card ? idx : -1).filter(idx => idx !== -1 && game.board[idx] === null);
@@ -180,7 +177,6 @@ function triggerBotTurn(roomId) {
       }
     }
 
-    // If no normal moves, use a Wild Jack randomly
     if (!moved) {
       const twoEyed = hand.find(c => c === 'J♦' || c === 'J♣');
       if (twoEyed) {
@@ -189,7 +185,6 @@ function triggerBotTurn(roomId) {
       }
     }
 
-    // If still stuck, use Remove Jack randomly
     if (!moved) {
       const oneEyed = hand.find(c => c === 'J♠' || c === 'J♥');
       if (oneEyed) {
@@ -198,18 +193,15 @@ function triggerBotTurn(roomId) {
       }
     }
 
-    // If completely stuck (dead cards only), just skip turn
     if (!moved) {
       logAction(roomId, `${game.playerNames[activeId]} had no valid moves and skipped.`);
       advanceTurn(roomId);
     }
     
-    // Broadcast hand to bot (not strictly necessary but keeps state clean)
     io.to(roomId).emit('bot_played');
     broadcastGameState(roomId);
-  }, 2000); // 2 second delay to feel human
+  }, 2000); 
 }
-
 
 io.on('connection', (socket) => {
   socket.on('join_room', (data) => {
@@ -219,6 +211,7 @@ io.on('connection', (socket) => {
 
     if (!games[roomId]) {
       games[roomId] = {
+        host: playerId, // NEW: The first creator is the Host
         board: Array(100).fill(null), turn: 'red', players: [], teamMap: {}, playerNames: {},
         teamRosters: { red: [], blue: [], green: [] }, teamTurnIndex: { red: 0, blue: 0, green: 0 },  
         deck: generateShuffledDeck(), hands: {}, winner: null, winningLine: [], logs: [], 
@@ -264,7 +257,6 @@ io.on('connection', (socket) => {
     broadcastRoomInfo(roomId); broadcastGameState(roomId);
   });
 
-  // ADD BOT LOGIC
   socket.on('add_bot', (data) => {
     const { roomId, teamColor } = data;
     const game = games[roomId];
@@ -296,12 +288,11 @@ io.on('connection', (socket) => {
     game.turnDeadline = Date.now() + 60000;
     logAction(roomId, "MATCH STARTED!");
     broadcastGameState(roomId);
-    triggerBotTurn(roomId); // In case a bot goes first
+    triggerBotTurn(roomId); 
   });
 
   socket.on('ping_cell', (data) => {
     const { roomId, index, teamColor } = data;
-    // Relay ping to everyone, frontend filters by teamColor
     io.to(roomId).emit('receive_ping', { index, teamColor });
   });
 
