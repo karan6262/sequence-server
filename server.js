@@ -135,14 +135,18 @@ function executeMove(roomId, playerId, index, playedCard, teamColor) {
     if (isOneEyed) logAction(roomId, `${pName} removed a chip with ${playedCard}`);
     else logAction(roomId, `${pName} played ${playedCard}`);
 
+    // In sequence-server/server.js -> socket.on('place_chip', ...)
+      
     const winLine = checkWin(game.board, teamColor);
     if (winLine) {
-      game.winner = teamColor;
-      game.winningLine = winLine;
-      logAction(roomId, `${teamColor.toUpperCase()} TEAM WINS!`);
-    } else {
-      advanceTurn(roomId);
-    }
+        game.winner = teamColor;
+        game.winningLine = winLine;
+        // The fix is the REMOVAL of this line:
+        // game.isGameStarted = false; 
+        logAction(roomId, `${teamColor.toUpperCase()} TEAM WINS!`);
+      } else {
+        advanceTurn(roomId);
+      }
     
     const hand = game.hands[playerId];
     if (hand && hand.indexOf(playedCard) > -1) {
