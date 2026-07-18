@@ -71,9 +71,11 @@ function broadcastRoomInfo(roomId) {
   const game = games[roomId];
   if (!game) return;
   const roster = { red: [], blue: [], green: [], unassigned: [], total: game.players.length };
-  for (let socketId of game.players) {
-    const team = game.teamMap[socketId];
-    const name = game.playerNames[socketId];
+  
+  // Now iterating over playerIds instead of socketIds
+  for (let playerId of game.players) {
+    const team = game.teamMap[playerId];
+    const name = game.playerNames[playerId];
     if (team) roster[team].push(name);
     else roster.unassigned.push(name);
   }
@@ -90,7 +92,7 @@ function broadcastGameState(roomId) {
   io.to(roomId).emit('game_state', { 
     board: game.board, 
     turn: game.turn, 
-    activePlayerId: activeId,
+    activePlayerId: activeId, // This is now a playerId, not a socketId
     activePlayerName: activeName,
     winner: game.winner 
   });
@@ -99,30 +101,51 @@ function broadcastGameState(roomId) {
 io.on('connection', (socket) => {
   
   socket.on('join_room', (data) => {
-    const { roomId, playerName } = data;
+    const { roomId, playerName, playerId } = data;
     socket.join(roomId);
     
+    // Bind the unique ID to this socket instance
+    socket.playerId = playerId; 
+    socket.roomId = roomId;
+
     if (!games[roomId]) {
       games[roomId] = {
         board: Array(100).fill(null),
         turn: 'red',
-        players: [],
-        teamMap: {},
-        playerNames: {},
+        players: [], // Array of playerIds
+        teamMap: {}, // Maps playerId to team
+        playerNames: {}, // Maps playerId to name
         teamRosters: { red: [], blue: [], green: [] }, 
         teamTurnIndex: { red: 0, blue: 0, green: 0 },  
         deck: generateShuffledDeck(),
-        hands: {},
+        hands: {}, // Maps playerId to hand
         winner: null
       };
     }
     
     const game = games[roomId];
-    if (!game.players.includes(socket.id)) {
-      if (game.players.length >= 12) return socket.emit('error_message', 'Room is full.');
-      game.players.push(socket.id);
+    
+    // RECONNECTION LOGIC
+    if (game.players.includes(playerId)) {
+      // User is already in the game (refreshed browser)
+      game.playerNames[playerId] = playerName || game.playerNames[playerId]; // Update name
+      socket.emit('room_joined', roomId);
+      
+      // If they already picked a team, bypass lobby and send them straight back to the game
+      if (game.teamMap[playerId]) {
+        socket.emit('assigned_team', game.teamMap[playerId]);
+        socket.emit('your_hand', game.hands[playerId]);
+      }
+      broadcastRoomInfo(roomId); 
+      broadcastGameState(roomId);
+      return;
     }
-    game.playerNames[socket.id] = playerName || 'Guest';
+
+    // NEW PLAYER LOGIC
+    if (game.players.length >= 12) return socket.emit('error_message', 'Room is full.');
+    
+    game.players.push(playerId);
+    game.playerNames[playerId] = playerName || 'Guest';
     
     socket.emit('room_joined', roomId);
     broadcastRoomInfo(roomId); 
@@ -130,39 +153,40 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join_team', (data) => {
-    const { roomId, teamColor } = data;
+    const { roomId, teamColor, playerId } = data;
     const game = games[roomId];
     if (!game) return;
 
     if (game.teamRosters[teamColor].length >= 4) return socket.emit('error_message', 'That team is full!');
+    if (game.teamMap[playerId]) return; // Prevent joining multiple teams
 
-    game.teamMap[socket.id] = teamColor;
-    game.teamRosters[teamColor].push(socket.id); 
+    game.teamMap[playerId] = teamColor;
+    game.teamRosters[teamColor].push(playerId); 
     
     if (game.teamRosters[game.turn].length === 0) {
       game.turn = teamColor;
     }
 
-    if (!game.hands[socket.id]) {
-        game.hands[socket.id] = game.deck.splice(0, 5);
+    if (!game.hands[playerId]) {
+        game.hands[playerId] = game.deck.splice(0, 5);
     }
     
     socket.emit('assigned_team', teamColor);
-    socket.emit('your_hand', game.hands[socket.id]);
+    socket.emit('your_hand', game.hands[playerId]);
     
     broadcastRoomInfo(roomId); 
     broadcastGameState(roomId);
   });
 
   socket.on('place_chip', (data) => {
-    const { roomId, index, teamColor, playedCard } = data;
+    const { roomId, index, teamColor, playedCard, playerId } = data;
     const game = games[roomId];
 
     if (!game || game.winner) return;
 
     if (game.turn !== teamColor) return;
     const expectedPlayerId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
-    if (socket.id !== expectedPlayerId) return; 
+    if (playerId !== expectedPlayerId) return; 
 
     const isTwoEyedJack = playedCard === 'J♦' || playedCard === 'J♣';
     const isOneEyedJack = playedCard === 'J♠' || playedCard === 'J♥';
@@ -187,7 +211,7 @@ io.on('connection', (socket) => {
         game.turn = getNextTeam(game.turn, game.teamRosters);
       }
       
-      const playerHand = game.hands[socket.id];
+      const playerHand = game.hands[playerId];
       const cardIndex = playerHand.indexOf(playedCard);
       if (cardIndex > -1) playerHand.splice(cardIndex, 1); 
 
@@ -198,60 +222,34 @@ io.on('connection', (socket) => {
     }
   });
 
-  // NEW: Restart Game Logic
   socket.on('restart_game', (roomId) => {
     const game = games[roomId];
     if (!game) return;
 
-    // Reset game state
     game.board = Array(100).fill(null);
     game.winner = null;
     game.deck = generateShuffledDeck();
     game.teamTurnIndex = { red: 0, blue: 0, green: 0 };
     
-    // Default turn to whichever team has players first
     if (game.teamRosters.red.length > 0) game.turn = 'red';
     else if (game.teamRosters.blue.length > 0) game.turn = 'blue';
     else if (game.teamRosters.green.length > 0) game.turn = 'green';
 
-    // Redeal 5 cards to every player in the room
-    game.players.forEach(playerId => {
-      game.hands[playerId] = game.deck.splice(0, 5);
-      io.to(playerId).emit('your_hand', game.hands[playerId]);
+    // Broadcast new hands to the specific sockets in the room
+    game.players.forEach(pid => {
+      game.hands[pid] = game.deck.splice(0, 5);
     });
-
+    
+    // We send to everyone in the room; the frontend will grab their specific hand
+    io.to(roomId).emit('game_restarted', game.hands);
     broadcastGameState(roomId);
   });
 
   socket.on('disconnect', () => {
-    for (let roomId in games) {
-      const game = games[roomId];
-      const index = game.players.indexOf(socket.id);
-      
-      if (index !== -1) {
-        game.players.splice(index, 1);
-        const team = game.teamMap[socket.id];
-        
-        if (team) {
-          const roster = game.teamRosters[team];
-          const rosterIndex = roster.indexOf(socket.id);
-          if (rosterIndex !== -1) roster.splice(rosterIndex, 1);
-          
-          if (game.teamTurnIndex[team] >= roster.length && roster.length > 0) {
-             game.teamTurnIndex[team] = 0;
-          }
-          if (game.turn === team && roster.length === 0) {
-             game.turn = getNextTeam(team, game.teamRosters);
-          }
-        }
-        
-        delete game.teamMap[socket.id];
-        delete game.playerNames[socket.id];
-        
-        broadcastRoomInfo(roomId);
-        broadcastGameState(roomId);
-      }
-    }
+    // We intentionally DO NOT delete the player from the game arrays here.
+    // This allows them to refresh the page and instantly rejoin using their playerId.
+    // If the game completes or sits empty for hours, memory will eventually wipe when the server restarts.
+    console.log(`Socket disconnected, but keeping playerId: ${socket.playerId} active in memory.`);
   });
 });
 
