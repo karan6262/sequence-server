@@ -60,7 +60,6 @@ function checkWin(board, team) {
 const games = {};
 const NEXT_TURN = { 'red': 'blue', 'blue': 'green', 'green': 'red' };
 
-// Skip teams that have 0 players in them
 function getNextTeam(currentTeam, teamRosters) {
   let next = NEXT_TURN[currentTeam];
   if (teamRosters[next].length === 0) next = NEXT_TURN[next];
@@ -81,7 +80,6 @@ function broadcastRoomInfo(roomId) {
   io.to(roomId).emit('room_info', roster);
 }
 
-// NEW: Helper to broadcast the exact player whose turn it is
 function broadcastGameState(roomId) {
   const game = games[roomId];
   if (!game) return;
@@ -111,8 +109,8 @@ io.on('connection', (socket) => {
         players: [],
         teamMap: {},
         playerNames: {},
-        teamRosters: { red: [], blue: [], green: [] }, // TRACKS TURN ORDER
-        teamTurnIndex: { red: 0, blue: 0, green: 0 },  // TRACKS WHOSE TURN IT IS
+        teamRosters: { red: [], blue: [], green: [] }, 
+        teamTurnIndex: { red: 0, blue: 0, green: 0 },  
         deck: generateShuffledDeck(),
         hands: {},
         winner: null
@@ -139,9 +137,8 @@ io.on('connection', (socket) => {
     if (game.teamRosters[teamColor].length >= 4) return socket.emit('error_message', 'That team is full!');
 
     game.teamMap[socket.id] = teamColor;
-    game.teamRosters[teamColor].push(socket.id); // Add player to their team's turn order
+    game.teamRosters[teamColor].push(socket.id); 
     
-    // If this is the very first player to join the room, switch turn to their color
     if (game.teamRosters[game.turn].length === 0) {
       game.turn = teamColor;
     }
@@ -163,10 +160,9 @@ io.on('connection', (socket) => {
 
     if (!game || game.winner) return;
 
-    // EXACT TURN VALIDATION
     if (game.turn !== teamColor) return;
     const expectedPlayerId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
-    if (socket.id !== expectedPlayerId) return; // Ignore if not this specific player's turn
+    if (socket.id !== expectedPlayerId) return; 
 
     const isTwoEyedJack = playedCard === 'J♦' || playedCard === 'J♣';
     const isOneEyedJack = playedCard === 'J♠' || playedCard === 'J♥';
@@ -187,10 +183,7 @@ io.on('connection', (socket) => {
       if (checkWin(game.board, teamColor)) {
         game.winner = teamColor;
       } else {
-        // MOVE TO NEXT PLAYER ON THIS TEAM
         game.teamTurnIndex[game.turn] = (game.teamTurnIndex[game.turn] + 1) % game.teamRosters[game.turn].length;
-        
-        // SWITCH OVERALL TURN TO NEXT TEAM
         game.turn = getNextTeam(game.turn, game.teamRosters);
       }
       
@@ -205,13 +198,37 @@ io.on('connection', (socket) => {
     }
   });
 
+  // NEW: Restart Game Logic
+  socket.on('restart_game', (roomId) => {
+    const game = games[roomId];
+    if (!game) return;
+
+    // Reset game state
+    game.board = Array(100).fill(null);
+    game.winner = null;
+    game.deck = generateShuffledDeck();
+    game.teamTurnIndex = { red: 0, blue: 0, green: 0 };
+    
+    // Default turn to whichever team has players first
+    if (game.teamRosters.red.length > 0) game.turn = 'red';
+    else if (game.teamRosters.blue.length > 0) game.turn = 'blue';
+    else if (game.teamRosters.green.length > 0) game.turn = 'green';
+
+    // Redeal 5 cards to every player in the room
+    game.players.forEach(playerId => {
+      game.hands[playerId] = game.deck.splice(0, 5);
+      io.to(playerId).emit('your_hand', game.hands[playerId]);
+    });
+
+    broadcastGameState(roomId);
+  });
+
   socket.on('disconnect', () => {
     for (let roomId in games) {
       const game = games[roomId];
       const index = game.players.indexOf(socket.id);
       
       if (index !== -1) {
-        // Remove from tracking arrays
         game.players.splice(index, 1);
         const team = game.teamMap[socket.id];
         
@@ -220,12 +237,11 @@ io.on('connection', (socket) => {
           const rosterIndex = roster.indexOf(socket.id);
           if (rosterIndex !== -1) roster.splice(rosterIndex, 1);
           
-          // Adjust turn index so it doesn't break if someone leaves during the game
           if (game.teamTurnIndex[team] >= roster.length && roster.length > 0) {
              game.teamTurnIndex[team] = 0;
           }
           if (game.turn === team && roster.length === 0) {
-             game.turn = getNextTeam(team, game.teamRosters); // Skip empty team
+             game.turn = getNextTeam(team, game.teamRosters);
           }
         }
         
