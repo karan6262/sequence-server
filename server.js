@@ -51,13 +51,10 @@ function checkWin(board, team) {
     for (let c = 0; c < 10; c++) {
       const directions = [[0, 1], [1, 0], [1, 1], [-1, 1]];
       for (let [dr, dc] of directions) {
-        let count = 0;
-        let line = [];
+        let count = 0; let line = [];
         for (let i = 0; i < 5; i++) {
-          if (getCell(r + dr * i, c + dc * i) === team) {
-            count++;
-            line.push((r + dr * i) * 10 + (c + dc * i));
-          } else break;
+          if (getCell(r + dr * i, c + dc * i) === team) { count++; line.push((r + dr * i) * 10 + (c + dc * i)); } 
+          else break;
         }
         if (count === 5) return line;
       }
@@ -88,6 +85,7 @@ function advanceTurn(roomId) {
   game.teamTurnIndex[game.turn] = (game.teamTurnIndex[game.turn] + 1) % game.teamRosters[game.turn].length;
   game.turn = getNextTeam(game.turn, game.teamRosters);
   game.turnDeadline = Date.now() + 60000; 
+  triggerBotTurn(roomId);
 }
 
 function broadcastGameState(roomId) {
@@ -99,7 +97,7 @@ function broadcastGameState(roomId) {
   io.to(roomId).emit('game_state', { 
     board: game.board, turn: game.turn, activePlayerId: activeId, activePlayerName: activeName,
     winner: game.winner, winningLine: game.winningLine, logs: game.logs, 
-    turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted // NEW: Send started state
+    turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted 
   });
 }
 
@@ -115,10 +113,107 @@ function broadcastRoomInfo(roomId) {
   io.to(roomId).emit('room_info', roster);
 }
 
+// core logic for placing a chip (used by humans AND bots)
+function executeMove(roomId, playerId, index, playedCard, teamColor) {
+  const game = games[roomId];
+  if (!game || game.winner || !game.isGameStarted) return false;
+
+  const isTwoEyed = playedCard === 'J♦' || playedCard === 'J♣';
+  const isOneEyed = playedCard === 'J♠' || playedCard === 'J♥';
+  let validMove = false;
+
+  if (isTwoEyed && game.board[index] === null) {
+    game.board[index] = teamColor; validMove = true;
+  } else if (isOneEyed && game.board[index] !== null && game.board[index] !== teamColor) {
+    game.board[index] = null; validMove = true;
+  } else if (!isTwoEyed && !isOneEyed && game.board[index] === null) {
+    game.board[index] = teamColor; validMove = true;
+  }
+
+  if (validMove) {
+    const pName = game.playerNames[playerId];
+    if (isOneEyed) logAction(roomId, `${pName} removed a chip with ${playedCard}`);
+    else logAction(roomId, `${pName} played ${playedCard}`);
+
+    const winLine = checkWin(game.board, teamColor);
+    if (winLine) {
+      game.winner = teamColor;
+      game.winningLine = winLine;
+      logAction(roomId, `${teamColor.toUpperCase()} TEAM WINS!`);
+    } else {
+      advanceTurn(roomId);
+    }
+    
+    const hand = game.hands[playerId];
+    if (hand && hand.indexOf(playedCard) > -1) {
+      hand.splice(hand.indexOf(playedCard), 1); 
+      if (game.deck.length > 0) hand.push(game.deck.shift()); 
+    }
+    return true;
+  }
+  return false;
+}
+
+// AI Bot Engine
+function triggerBotTurn(roomId) {
+  const game = games[roomId];
+  if (!game || !game.isGameStarted || game.winner) return;
+
+  const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]];
+  if (!activeId || !activeId.startsWith('bot_')) return;
+
+  setTimeout(() => {
+    // Make sure it's still the bot's turn
+    if (game.teamRosters[game.turn][game.teamTurnIndex[game.turn]] !== activeId) return;
+
+    const hand = game.hands[activeId];
+    const teamColor = game.turn;
+    let moved = false;
+
+    // AI Logic: Try to play a regular card first
+    for (let card of hand) {
+      if (card.includes('J')) continue;
+      let validIndices = BOARD_LAYOUT.map((val, idx) => val === card ? idx : -1).filter(idx => idx !== -1 && game.board[idx] === null);
+      if (validIndices.length > 0) {
+        moved = executeMove(roomId, activeId, validIndices[0], card, teamColor);
+        if (moved) break;
+      }
+    }
+
+    // If no normal moves, use a Wild Jack randomly
+    if (!moved) {
+      const twoEyed = hand.find(c => c === 'J♦' || c === 'J♣');
+      if (twoEyed) {
+        let emptyIdx = game.board.findIndex((val, idx) => val === null && BOARD_LAYOUT[idx] !== 'FREE');
+        if (emptyIdx !== -1) moved = executeMove(roomId, activeId, emptyIdx, twoEyed, teamColor);
+      }
+    }
+
+    // If still stuck, use Remove Jack randomly
+    if (!moved) {
+      const oneEyed = hand.find(c => c === 'J♠' || c === 'J♥');
+      if (oneEyed) {
+        let oppIdx = game.board.findIndex((val, idx) => val !== null && val !== teamColor && BOARD_LAYOUT[idx] !== 'FREE');
+        if (oppIdx !== -1) moved = executeMove(roomId, activeId, oppIdx, oneEyed, teamColor);
+      }
+    }
+
+    // If completely stuck (dead cards only), just skip turn
+    if (!moved) {
+      logAction(roomId, `${game.playerNames[activeId]} had no valid moves and skipped.`);
+      advanceTurn(roomId);
+    }
+    
+    // Broadcast hand to bot (not strictly necessary but keeps state clean)
+    io.to(roomId).emit('bot_played');
+    broadcastGameState(roomId);
+  }, 2000); // 2 second delay to feel human
+}
+
+
 io.on('connection', (socket) => {
-  
   socket.on('join_room', (data) => {
-    const { roomId, playerName, playerId } = data;
+    const { roomId, playerName, playerId, avatar } = data;
     socket.join(roomId);
     socket.playerId = playerId; 
 
@@ -127,14 +222,14 @@ io.on('connection', (socket) => {
         board: Array(100).fill(null), turn: 'red', players: [], teamMap: {}, playerNames: {},
         teamRosters: { red: [], blue: [], green: [] }, teamTurnIndex: { red: 0, blue: 0, green: 0 },  
         deck: generateShuffledDeck(), hands: {}, winner: null, winningLine: [], logs: [], 
-        turnDeadline: null, isGameStarted: false // NEW: Game does not start automatically
+        turnDeadline: null, isGameStarted: false 
       };
       logAction(roomId, "Room created.");
     }
     
     const game = games[roomId];
     if (game.players.includes(playerId)) {
-      game.playerNames[playerId] = playerName || game.playerNames[playerId];
+      game.playerNames[playerId] = `${avatar} ${playerName}` || game.playerNames[playerId];
       socket.emit('room_joined', roomId);
       if (game.teamMap[playerId]) {
         socket.emit('assigned_team', game.teamMap[playerId]);
@@ -146,7 +241,7 @@ io.on('connection', (socket) => {
 
     if (game.players.length >= 12) return socket.emit('error_message', 'Room is full.');
     game.players.push(playerId);
-    game.playerNames[playerId] = playerName || 'Guest';
+    game.playerNames[playerId] = `${avatar} ${playerName}` || 'Guest';
     logAction(roomId, `${game.playerNames[playerId]} connected.`);
     
     socket.emit('room_joined', roomId);
@@ -161,7 +256,6 @@ io.on('connection', (socket) => {
 
     game.teamMap[playerId] = teamColor;
     game.teamRosters[teamColor].push(playerId); 
-    
     if (!game.hands[playerId]) game.hands[playerId] = game.deck.splice(0, 5);
     
     logAction(roomId, `${game.playerNames[playerId]} joined ${teamColor.toUpperCase()}`);
@@ -170,12 +264,29 @@ io.on('connection', (socket) => {
     broadcastRoomInfo(roomId); broadcastGameState(roomId);
   });
 
-  // NEW: Start Game Event
+  // ADD BOT LOGIC
+  socket.on('add_bot', (data) => {
+    const { roomId, teamColor } = data;
+    const game = games[roomId];
+    if (!game || game.teamRosters[teamColor].length >= 4 || game.players.length >= 12) return;
+
+    const botId = 'bot_' + Math.random().toString(36).substr(2, 9);
+    const botNum = Math.floor(Math.random() * 99);
+    
+    game.players.push(botId);
+    game.playerNames[botId] = `🤖 Bot ${botNum}`;
+    game.teamMap[botId] = teamColor;
+    game.teamRosters[teamColor].push(botId);
+    game.hands[botId] = game.deck.splice(0, 5);
+
+    logAction(roomId, `${game.playerNames[botId]} was deployed to ${teamColor.toUpperCase()}`);
+    broadcastRoomInfo(roomId); broadcastGameState(roomId);
+  });
+
   socket.on('start_game', (roomId) => {
     const game = games[roomId];
     if (!game || game.isGameStarted) return;
     
-    // Assign turn to first team that has players
     if (game.teamRosters.red.length > 0) game.turn = 'red';
     else if (game.teamRosters.blue.length > 0) game.turn = 'blue';
     else if (game.teamRosters.green.length > 0) game.turn = 'green';
@@ -185,6 +296,13 @@ io.on('connection', (socket) => {
     game.turnDeadline = Date.now() + 60000;
     logAction(roomId, "MATCH STARTED!");
     broadcastGameState(roomId);
+    triggerBotTurn(roomId); // In case a bot goes first
+  });
+
+  socket.on('ping_cell', (data) => {
+    const { roomId, index, teamColor } = data;
+    // Relay ping to everyone, frontend filters by teamColor
+    io.to(roomId).emit('receive_ping', { index, teamColor });
   });
 
   socket.on('send_chat', (data) => {
@@ -231,57 +349,24 @@ io.on('connection', (socket) => {
   socket.on('place_chip', (data) => {
     const { roomId, index, teamColor, playedCard, playerId } = data;
     const game = games[roomId];
-    if (!game || game.winner || !game.isGameStarted) return; 
+    if (!game || game.winner || !game.isGameStarted) return;
 
     const expectedId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
     if (playerId !== expectedId) return; 
 
-    const isTwoEyed = playedCard === 'J♦' || playedCard === 'J♣';
-    const isOneEyed = playedCard === 'J♠' || playedCard === 'J♥';
-    let validMove = false;
-
-    if (isTwoEyed && game.board[index] === null) {
-      game.board[index] = teamColor; validMove = true;
-    } else if (isOneEyed && game.board[index] !== null && game.board[index] !== teamColor) {
-      game.board[index] = null; validMove = true;
-    } else if (!isTwoEyed && !isOneEyed && game.board[index] === null) {
-      game.board[index] = teamColor; validMove = true;
-    }
-
-    if (validMove) {
-      const pName = game.playerNames[playerId];
-      if (isOneEyed) logAction(roomId, `${pName} removed a chip with ${playedCard}`);
-      else logAction(roomId, `${pName} played ${playedCard}`);
-
-      const winLine = checkWin(game.board, teamColor);
-      if (winLine) {
-        game.winner = teamColor;
-        game.winningLine = winLine;
-        // REMOVED: game.isGameStarted = false; (Keep this true so turn layouts don't crash)
-        logAction(roomId, `${teamColor.toUpperCase()} TEAM WINS!`);
-      } else {
-        advanceTurn(roomId);
-      }
-      
-      const hand = game.hands[playerId];
-      if (hand && hand.indexOf(playedCard) > -1) {
-        hand.splice(hand.indexOf(playedCard), 1); 
-        if (game.deck.length > 0) hand.push(game.deck.shift()); 
-      }
-
-      socket.emit('your_hand', hand || []);
+    if (executeMove(roomId, playerId, index, playedCard, teamColor)) {
+      socket.emit('your_hand', game.hands[playerId] || []);
       broadcastGameState(roomId);
     }
   });
+
   socket.on('restart_game', (roomId) => {
     const game = games[roomId];
     if (!game) return;
     
-    // Reset everything, but keep isGameStarted false so they have to manually start round 2
     game.board = Array(100).fill(null); game.winner = null; game.winningLine = [];
     game.deck = generateShuffledDeck(); game.teamTurnIndex = { red: 0, blue: 0, green: 0 };
-    game.turnDeadline = null;
-    game.isGameStarted = false; 
+    game.turnDeadline = null; game.isGameStarted = false; 
 
     logAction(roomId, "Game Restarted. Waiting to begin...");
     game.players.forEach(pid => {
