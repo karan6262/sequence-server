@@ -7,23 +7,29 @@ const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*", 
-    methods: ["GET", "POST"]
-  }
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
 const SUITS = ['♠', '♣', '♥', '♦'];
 const VALUES = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A'];
+
+const BOARD_LAYOUT = [
+  'FREE', '2♠', '3♠', '4♠', '5♠', '6♠', '7♠', '8♠', '9♠', 'FREE',
+  '6♣', '5♣', '4♣', '3♣', '2♣', 'A♥', 'K♥', 'Q♥', '10♥', '10♠',
+  '7♣', 'A♠', '2♦', '3♦', '4♦', '5♦', '6♦', '7♦', '9♥', 'Q♠',
+  '8♣', 'K♠', '6♣', '5♣', '4♣', '3♣', '2♣', '8♦', '8♥', 'K♠',
+  '9♣', 'Q♠', '7♣', '6♥', '5♥', '4♥', 'A♥', '9♦', '7♥', 'A♠',
+  '10♣', '10♠', '8♣', '7♥', '2♥', '3♥', 'K♥', '10♦', '6♥', '2♦',
+  'Q♣', '9♠', '9♣', '8♥', '9♥', '10♥', 'Q♥', 'Q♦', '5♥', '3♦',
+  'K♣', '8♠', '10♣', 'Q♣', 'K♣', 'A♣', 'A♦', 'K♦', '4♥', '4♦',
+  'A♣', '7♠', '6♠', '5♠', '4♠', '3♠', '2♠', '2♥', '3♥', '5♦',
+  'FREE', 'A♦', 'K♦', 'Q♦', '10♦', '9♦', '8♦', '7♦', '6♦', 'FREE'
+];
 
 function generateShuffledDeck() {
   let deck = [];
   for (let i = 0; i < 2; i++) {
     for (let suit of SUITS) {
-      for (let value of VALUES) {
-        deck.push(`${value}${suit}`);
-      }
+      for (let value of VALUES) deck.push(`${value}${suit}`);
     }
   }
   for (let i = deck.length - 1; i > 0; i--) {
@@ -33,6 +39,7 @@ function generateShuffledDeck() {
   return deck;
 }
 
+// Upgraded to return winning sequence coordinates
 function checkWin(board, team) {
   const getCell = (r, c) => {
     if (r < 0 || r > 9 || c < 0 || c > 9) return null;
@@ -46,15 +53,18 @@ function checkWin(board, team) {
       const directions = [[0, 1], [1, 0], [1, 1], [-1, 1]];
       for (let [dr, dc] of directions) {
         let count = 0;
+        let line = [];
         for (let i = 0; i < 5; i++) {
-          if (getCell(r + dr * i, c + dc * i) === team) count++;
-          else break;
+          if (getCell(r + dr * i, c + dc * i) === team) {
+            count++;
+            line.push((r + dr * i) * 10 + (c + dc * i));
+          } else break;
         }
-        if (count === 5) return true;
+        if (count === 5) return line;
       }
     }
   }
-  return false;
+  return null;
 }
 
 const games = {};
@@ -67,35 +77,42 @@ function getNextTeam(currentTeam, teamRosters) {
   return next;
 }
 
-function broadcastRoomInfo(roomId) {
+function logAction(roomId, message) {
   const game = games[roomId];
   if (!game) return;
-  const roster = { red: [], blue: [], green: [], unassigned: [], total: game.players.length };
-  
-  // Now iterating over playerIds instead of socketIds
-  for (let playerId of game.players) {
-    const team = game.teamMap[playerId];
-    const name = game.playerNames[playerId];
-    if (team) roster[team].push(name);
-    else roster.unassigned.push(name);
-  }
-  io.to(roomId).emit('room_info', roster);
+  game.logs.unshift(message);
+  if (game.logs.length > 20) game.logs.pop(); // Keep last 20 logs
+}
+
+function advanceTurn(roomId) {
+  const game = games[roomId];
+  game.teamTurnIndex[game.turn] = (game.teamTurnIndex[game.turn] + 1) % game.teamRosters[game.turn].length;
+  game.turn = getNextTeam(game.turn, game.teamRosters);
+  game.turnDeadline = Date.now() + 60000; // 60 seconds
 }
 
 function broadcastGameState(roomId) {
   const game = games[roomId];
   if (!game) return;
-  
   const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]] || null;
-  const activeName = activeId ? game.playerNames[activeId] : 'Waiting for players...';
+  const activeName = activeId ? game.playerNames[activeId] : 'Waiting...';
 
   io.to(roomId).emit('game_state', { 
-    board: game.board, 
-    turn: game.turn, 
-    activePlayerId: activeId, // This is now a playerId, not a socketId
-    activePlayerName: activeName,
-    winner: game.winner 
+    board: game.board, turn: game.turn, activePlayerId: activeId, activePlayerName: activeName,
+    winner: game.winner, winningLine: game.winningLine, logs: game.logs, turnDeadline: game.turnDeadline
   });
+}
+
+function broadcastRoomInfo(roomId) {
+  const game = games[roomId];
+  if (!game) return;
+  const roster = { red: [], blue: [], green: [], unassigned: [], total: game.players.length };
+  for (let pid of game.players) {
+    const team = game.teamMap[pid];
+    if (team) roster[team].push(game.playerNames[pid]);
+    else roster.unassigned.push(game.playerNames[pid]);
+  }
+  io.to(roomId).emit('room_info', roster);
 }
 
 io.on('connection', (socket) => {
@@ -103,121 +120,138 @@ io.on('connection', (socket) => {
   socket.on('join_room', (data) => {
     const { roomId, playerName, playerId } = data;
     socket.join(roomId);
-    
-    // Bind the unique ID to this socket instance
     socket.playerId = playerId; 
-    socket.roomId = roomId;
 
     if (!games[roomId]) {
       games[roomId] = {
-        board: Array(100).fill(null),
-        turn: 'red',
-        players: [], // Array of playerIds
-        teamMap: {}, // Maps playerId to team
-        playerNames: {}, // Maps playerId to name
-        teamRosters: { red: [], blue: [], green: [] }, 
-        teamTurnIndex: { red: 0, blue: 0, green: 0 },  
-        deck: generateShuffledDeck(),
-        hands: {}, // Maps playerId to hand
-        winner: null
+        board: Array(100).fill(null), turn: 'red', players: [], teamMap: {}, playerNames: {},
+        teamRosters: { red: [], blue: [], green: [] }, teamTurnIndex: { red: 0, blue: 0, green: 0 },  
+        deck: generateShuffledDeck(), hands: {}, winner: null, winningLine: [], logs: [], turnDeadline: Date.now() + 60000
       };
+      logAction(roomId, "Room created.");
     }
     
     const game = games[roomId];
-    
-    // RECONNECTION LOGIC
     if (game.players.includes(playerId)) {
-      // User is already in the game (refreshed browser)
-      game.playerNames[playerId] = playerName || game.playerNames[playerId]; // Update name
+      game.playerNames[playerId] = playerName || game.playerNames[playerId];
       socket.emit('room_joined', roomId);
-      
-      // If they already picked a team, bypass lobby and send them straight back to the game
       if (game.teamMap[playerId]) {
         socket.emit('assigned_team', game.teamMap[playerId]);
         socket.emit('your_hand', game.hands[playerId]);
       }
-      broadcastRoomInfo(roomId); 
-      broadcastGameState(roomId);
+      broadcastRoomInfo(roomId); broadcastGameState(roomId);
       return;
     }
 
-    // NEW PLAYER LOGIC
     if (game.players.length >= 12) return socket.emit('error_message', 'Room is full.');
-    
     game.players.push(playerId);
     game.playerNames[playerId] = playerName || 'Guest';
+    logAction(roomId, `${game.playerNames[playerId]} connected.`);
     
     socket.emit('room_joined', roomId);
-    broadcastRoomInfo(roomId); 
-    broadcastGameState(roomId);
+    broadcastRoomInfo(roomId); broadcastGameState(roomId);
   });
 
   socket.on('join_team', (data) => {
     const { roomId, teamColor, playerId } = data;
     const game = games[roomId];
-    if (!game) return;
-
-    if (game.teamRosters[teamColor].length >= 4) return socket.emit('error_message', 'That team is full!');
-    if (game.teamMap[playerId]) return; // Prevent joining multiple teams
+    if (!game || game.teamMap[playerId]) return;
+    if (game.teamRosters[teamColor].length >= 4) return socket.emit('error_message', 'Team full!');
 
     game.teamMap[playerId] = teamColor;
     game.teamRosters[teamColor].push(playerId); 
+    if (game.teamRosters[game.turn].length === 1) game.turn = teamColor; // Start game if first
+    if (!game.hands[playerId]) game.hands[playerId] = game.deck.splice(0, 5);
     
-    if (game.teamRosters[game.turn].length === 0) {
-      game.turn = teamColor;
-    }
-
-    if (!game.hands[playerId]) {
-        game.hands[playerId] = game.deck.splice(0, 5);
-    }
-    
+    logAction(roomId, `${game.playerNames[playerId]} joined ${teamColor.toUpperCase()}`);
     socket.emit('assigned_team', teamColor);
     socket.emit('your_hand', game.hands[playerId]);
-    
-    broadcastRoomInfo(roomId); 
+    broadcastRoomInfo(roomId); broadcastGameState(roomId);
+  });
+
+  socket.on('send_chat', (data) => {
+    const { roomId, playerId, msg } = data;
+    const game = games[roomId];
+    if (game) io.to(roomId).emit('chat_message', { name: game.playerNames[playerId], team: game.teamMap[playerId], msg });
+  });
+
+  // Turn auto-skip timeout handler
+  socket.on('timeout_skip', (data) => {
+    const { roomId, playerId } = data;
+    const game = games[roomId];
+    if (!game || game.winner) return;
+    const expectedId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
+    if (playerId !== expectedId || Date.now() < game.turnDeadline) return;
+
+    logAction(roomId, `${game.playerNames[playerId]} ran out of time! Turn skipped.`);
+    advanceTurn(roomId);
     broadcastGameState(roomId);
+  });
+
+  // Trade Dead Card Logic
+  socket.on('trade_dead_card', (data) => {
+    const { roomId, playerId, deadCard } = data;
+    const game = games[roomId];
+    if (!game || game.winner) return;
+    
+    const expectedId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
+    if (playerId !== expectedId) return; // Must be their turn
+
+    // Verify card is actually dead
+    const indices = BOARD_LAYOUT.map((c, i) => c === deadCard ? i : -1).filter(i => i !== -1);
+    const isDead = indices.every(i => game.board[i] !== null);
+
+    if (isDead) {
+      const hand = game.hands[playerId];
+      hand.splice(hand.indexOf(deadCard), 1);
+      if (game.deck.length > 0) hand.push(game.deck.shift());
+      
+      logAction(roomId, `${game.playerNames[playerId]} traded a dead card.`);
+      socket.emit('your_hand', hand);
+      advanceTurn(roomId); // Trading ends turn
+      broadcastGameState(roomId);
+    }
   });
 
   socket.on('place_chip', (data) => {
     const { roomId, index, teamColor, playedCard, playerId } = data;
     const game = games[roomId];
-
     if (!game || game.winner) return;
 
-    if (game.turn !== teamColor) return;
-    const expectedPlayerId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
-    if (playerId !== expectedPlayerId) return; 
+    const expectedId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
+    if (playerId !== expectedId) return; 
 
-    const isTwoEyedJack = playedCard === 'J♦' || playedCard === 'J♣';
-    const isOneEyedJack = playedCard === 'J♠' || playedCard === 'J♥';
+    const isTwoEyed = playedCard === 'J♦' || playedCard === 'J♣';
+    const isOneEyed = playedCard === 'J♠' || playedCard === 'J♥';
     let validMove = false;
 
-    if (isTwoEyedJack && game.board[index] === null) {
-      game.board[index] = teamColor;
-      validMove = true;
-    } else if (isOneEyedJack && game.board[index] !== null && game.board[index] !== teamColor) {
-      game.board[index] = null;
-      validMove = true;
-    } else if (!isTwoEyedJack && !isOneEyedJack && game.board[index] === null) {
-      game.board[index] = teamColor;
-      validMove = true;
+    if (isTwoEyed && game.board[index] === null) {
+      game.board[index] = teamColor; validMove = true;
+    } else if (isOneEyed && game.board[index] !== null && game.board[index] !== teamColor) {
+      game.board[index] = null; validMove = true;
+    } else if (!isTwoEyed && !isOneEyed && game.board[index] === null) {
+      game.board[index] = teamColor; validMove = true;
     }
 
     if (validMove) {
-      if (checkWin(game.board, teamColor)) {
+      const pName = game.playerNames[playerId];
+      if (isOneEyed) logAction(roomId, `${pName} removed a chip with ${playedCard}`);
+      else logAction(roomId, `${pName} played ${playedCard}`);
+
+      const winLine = checkWin(game.board, teamColor);
+      if (winLine) {
         game.winner = teamColor;
+        game.winningLine = winLine;
+        logAction(roomId, `${teamColor.toUpperCase()} TEAM WINS!`);
       } else {
-        game.teamTurnIndex[game.turn] = (game.teamTurnIndex[game.turn] + 1) % game.teamRosters[game.turn].length;
-        game.turn = getNextTeam(game.turn, game.teamRosters);
+        advanceTurn(roomId);
       }
       
-      const playerHand = game.hands[playerId];
-      const cardIndex = playerHand.indexOf(playedCard);
-      if (cardIndex > -1) playerHand.splice(cardIndex, 1); 
+      const hand = game.hands[playerId];
+      hand.splice(hand.indexOf(playedCard), 1); 
+      if (game.deck.length > 0) hand.push(game.deck.shift()); 
 
-      if (game.deck.length > 0) playerHand.push(game.deck.shift()); 
-
-      socket.emit('your_hand', playerHand);
+      socket.emit('your_hand', hand);
       broadcastGameState(roomId);
     }
   });
@@ -225,33 +259,21 @@ io.on('connection', (socket) => {
   socket.on('restart_game', (roomId) => {
     const game = games[roomId];
     if (!game) return;
-
-    game.board = Array(100).fill(null);
-    game.winner = null;
-    game.deck = generateShuffledDeck();
-    game.teamTurnIndex = { red: 0, blue: 0, green: 0 };
+    game.board = Array(100).fill(null); game.winner = null; game.winningLine = [];
+    game.deck = generateShuffledDeck(); game.teamTurnIndex = { red: 0, blue: 0, green: 0 };
+    game.turnDeadline = Date.now() + 60000;
     
     if (game.teamRosters.red.length > 0) game.turn = 'red';
     else if (game.teamRosters.blue.length > 0) game.turn = 'blue';
     else if (game.teamRosters.green.length > 0) game.turn = 'green';
 
-    // Broadcast new hands to the specific sockets in the room
+    logAction(roomId, "Game Restarted.");
     game.players.forEach(pid => {
       game.hands[pid] = game.deck.splice(0, 5);
     });
-    
-    // We send to everyone in the room; the frontend will grab their specific hand
     io.to(roomId).emit('game_restarted', game.hands);
     broadcastGameState(roomId);
   });
-
-  socket.on('disconnect', () => {
-    // We intentionally DO NOT delete the player from the game arrays here.
-    // This allows them to refresh the page and instantly rejoin using their playerId.
-    // If the game completes or sits empty for hours, memory will eventually wipe when the server restarts.
-    console.log(`Socket disconnected, but keeping playerId: ${socket.playerId} active in memory.`);
-  });
 });
 
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(process.env.PORT || 3001, () => console.log('Server running'));
