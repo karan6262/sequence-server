@@ -9,7 +9,7 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Make sure this is "*" for Render deployment
+    origin: "*", 
     methods: ["GET", "POST"]
   }
 });
@@ -60,28 +60,46 @@ function checkWin(board, team) {
 const games = {};
 const NEXT_TURN = { 'red': 'blue', 'blue': 'green', 'green': 'red' };
 
-// Helper to broadcast lists of player names per team
+// Skip teams that have 0 players in them
+function getNextTeam(currentTeam, teamRosters) {
+  let next = NEXT_TURN[currentTeam];
+  if (teamRosters[next].length === 0) next = NEXT_TURN[next];
+  if (teamRosters[next].length === 0) next = NEXT_TURN[next];
+  return next;
+}
+
 function broadcastRoomInfo(roomId) {
   const game = games[roomId];
   if (!game) return;
-  
   const roster = { red: [], blue: [], green: [], unassigned: [], total: game.players.length };
-  
   for (let socketId of game.players) {
     const team = game.teamMap[socketId];
     const name = game.playerNames[socketId];
-    if (team) {
-      roster[team].push(name);
-    } else {
-      roster.unassigned.push(name);
-    }
+    if (team) roster[team].push(name);
+    else roster.unassigned.push(name);
   }
   io.to(roomId).emit('room_info', roster);
 }
 
+// NEW: Helper to broadcast the exact player whose turn it is
+function broadcastGameState(roomId) {
+  const game = games[roomId];
+  if (!game) return;
+  
+  const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]] || null;
+  const activeName = activeId ? game.playerNames[activeId] : 'Waiting for players...';
+
+  io.to(roomId).emit('game_state', { 
+    board: game.board, 
+    turn: game.turn, 
+    activePlayerId: activeId,
+    activePlayerName: activeName,
+    winner: game.winner 
+  });
+}
+
 io.on('connection', (socket) => {
   
-  // Step 1: User enters room code AND their name
   socket.on('join_room', (data) => {
     const { roomId, playerName } = data;
     socket.join(roomId);
@@ -92,7 +110,9 @@ io.on('connection', (socket) => {
         turn: 'red',
         players: [],
         teamMap: {},
-        playerNames: {}, // NEW: Store player names
+        playerNames: {},
+        teamRosters: { red: [], blue: [], green: [] }, // TRACKS TURN ORDER
+        teamTurnIndex: { red: 0, blue: 0, green: 0 },  // TRACKS WHOSE TURN IT IS
         deck: generateShuffledDeck(),
         hands: {},
         winner: null
@@ -100,54 +120,56 @@ io.on('connection', (socket) => {
     }
     
     const game = games[roomId];
-    
-    // Add player to room tracking if not already there
     if (!game.players.includes(socket.id)) {
-      if (game.players.length >= 12) return socket.emit('error_message', 'Room is full (12 players max).');
+      if (game.players.length >= 12) return socket.emit('error_message', 'Room is full.');
       game.players.push(socket.id);
     }
     game.playerNames[socket.id] = playerName || 'Guest';
     
     socket.emit('room_joined', roomId);
     broadcastRoomInfo(roomId); 
+    broadcastGameState(roomId);
   });
 
-  // Step 2: User selects a team
   socket.on('join_team', (data) => {
     const { roomId, teamColor } = data;
     const game = games[roomId];
     if (!game) return;
 
-    let teamCount = 0;
-    for (let p of game.players) {
-      if (game.teamMap[p] === teamColor) teamCount++;
-    }
-    if (teamCount >= 4) return socket.emit('error_message', 'That team is already full!');
+    if (game.teamRosters[teamColor].length >= 4) return socket.emit('error_message', 'That team is full!');
 
     game.teamMap[socket.id] = teamColor;
+    game.teamRosters[teamColor].push(socket.id); // Add player to their team's turn order
     
+    // If this is the very first player to join the room, switch turn to their color
+    if (game.teamRosters[game.turn].length === 0) {
+      game.turn = teamColor;
+    }
+
     if (!game.hands[socket.id]) {
         game.hands[socket.id] = game.deck.splice(0, 5);
     }
     
     socket.emit('assigned_team', teamColor);
     socket.emit('your_hand', game.hands[socket.id]);
-    io.to(roomId).emit('game_state', { board: game.board, turn: game.turn, winner: game.winner });
     
     broadcastRoomInfo(roomId); 
+    broadcastGameState(roomId);
   });
 
-  // Step 3: Game logic
   socket.on('place_chip', (data) => {
     const { roomId, index, teamColor, playedCard } = data;
     const game = games[roomId];
 
-    if (game.teamMap[socket.id] !== teamColor) return; 
     if (!game || game.winner) return;
+
+    // EXACT TURN VALIDATION
+    if (game.turn !== teamColor) return;
+    const expectedPlayerId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
+    if (socket.id !== expectedPlayerId) return; // Ignore if not this specific player's turn
 
     const isTwoEyedJack = playedCard === 'J♦' || playedCard === 'J♣';
     const isOneEyedJack = playedCard === 'J♠' || playedCard === 'J♥';
-
     let validMove = false;
 
     if (isTwoEyedJack && game.board[index] === null) {
@@ -165,7 +187,11 @@ io.on('connection', (socket) => {
       if (checkWin(game.board, teamColor)) {
         game.winner = teamColor;
       } else {
-        game.turn = NEXT_TURN[game.turn];
+        // MOVE TO NEXT PLAYER ON THIS TEAM
+        game.teamTurnIndex[game.turn] = (game.teamTurnIndex[game.turn] + 1) % game.teamRosters[game.turn].length;
+        
+        // SWITCH OVERALL TURN TO NEXT TEAM
+        game.turn = getNextTeam(game.turn, game.teamRosters);
       }
       
       const playerHand = game.hands[socket.id];
@@ -174,27 +200,44 @@ io.on('connection', (socket) => {
 
       if (game.deck.length > 0) playerHand.push(game.deck.shift()); 
 
-      io.to(roomId).emit('game_state', { board: game.board, turn: game.turn, winner: game.winner });
       socket.emit('your_hand', playerHand);
+      broadcastGameState(roomId);
     }
   });
 
-  // Clean up when a player leaves
   socket.on('disconnect', () => {
     for (let roomId in games) {
       const game = games[roomId];
       const index = game.players.indexOf(socket.id);
+      
       if (index !== -1) {
+        // Remove from tracking arrays
         game.players.splice(index, 1);
+        const team = game.teamMap[socket.id];
+        
+        if (team) {
+          const roster = game.teamRosters[team];
+          const rosterIndex = roster.indexOf(socket.id);
+          if (rosterIndex !== -1) roster.splice(rosterIndex, 1);
+          
+          // Adjust turn index so it doesn't break if someone leaves during the game
+          if (game.teamTurnIndex[team] >= roster.length && roster.length > 0) {
+             game.teamTurnIndex[team] = 0;
+          }
+          if (game.turn === team && roster.length === 0) {
+             game.turn = getNextTeam(team, game.teamRosters); // Skip empty team
+          }
+        }
+        
         delete game.teamMap[socket.id];
         delete game.playerNames[socket.id];
+        
         broadcastRoomInfo(roomId);
+        broadcastGameState(roomId);
       }
     }
   });
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
