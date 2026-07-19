@@ -211,19 +211,20 @@ io.on('connection', (socket) => {
   socket.on('join_room', (data) => {
     const { roomId, playerName, playerId, avatar } = data;
     socket.join(roomId);
-    socket.playerId = playerId; 
+    socket.playerId = playerId;
+    socket.roomId = roomId; // store room id for disconnect handling
 
     if (!games[roomId]) {
       games[roomId] = {
         host: playerId, // NEW: The first creator is the Host
         board: Array(100).fill(null), turn: 'red', players: [], teamMap: {}, playerNames: {},
-        teamRosters: { red: [], blue: [], green: [] }, teamTurnIndex: { red: 0, blue: 0, green: 0 },  
-        deck: generateShuffledDeck(), hands: {}, winner: null, winningLine: [], logs: [], 
-        turnDeadline: null, isGameStarted: false 
+        teamRosters: { red: [], blue: [], green: [] }, teamTurnIndex: { red: 0, blue: 0, green: 0 },
+        deck: generateShuffledDeck(), hands: {}, winner: null, winningLine: [], logs: [],
+        turnDeadline: null, isGameStarted: false
       };
       logAction(roomId, "Room created.");
     }
-    
+
     const game = games[roomId];
     if (game.players.includes(playerId)) {
       game.playerNames[playerId] = `${avatar} ${playerName}` || game.playerNames[playerId];
@@ -240,7 +241,7 @@ io.on('connection', (socket) => {
     game.players.push(playerId);
     game.playerNames[playerId] = `${avatar} ${playerName}` || 'Guest';
     logAction(roomId, `${game.playerNames[playerId]} connected.`);
-    
+
     socket.emit('room_joined', roomId);
     broadcastRoomInfo(roomId); broadcastGameState(roomId);
   });
@@ -358,10 +359,10 @@ io.on('connection', (socket) => {
   socket.on('restart_game', (roomId) => {
     const game = games[roomId];
     if (!game) return;
-    
+
     game.board = Array(100).fill(null); game.winner = null; game.winningLine = [];
     game.deck = generateShuffledDeck(); game.teamTurnIndex = { red: 0, blue: 0, green: 0 };
-    game.turnDeadline = null; game.isGameStarted = false; 
+    game.turnDeadline = null; game.isGameStarted = false;
 
     logAction(roomId, "Game Restarted. Waiting to begin...");
     game.players.forEach(pid => {
@@ -369,6 +370,50 @@ io.on('connection', (socket) => {
     });
     io.to(roomId).emit('game_restarted', game.hands);
     broadcastGameState(roomId);
+  });
+
+  socket.on('disconnect', () => {
+    const roomId = socket.roomId;
+    const playerId = socket.playerId;
+    if (!roomId || !playerId) return;
+
+    const game = games[roomId];
+    if (!game) return;
+
+    // Remove player from game
+    const playerIndex = game.players.indexOf(playerId);
+    if (playerIndex !== -1) {
+      game.players.splice(playerIndex, 1);
+      delete game.playerNames[playerId];
+      const team = game.teamMap[playerId];
+      if (team) {
+        delete game.teamMap[playerId];
+        const teamIndex = game.teamRosters[team].indexOf(playerId);
+        if (teamIndex !== -1) {
+          game.teamRosters[team].splice(teamIndex, 1);
+        }
+        delete game.hands[playerId];
+      } else {
+        // unassigned player
+      }
+
+      // If no players left, delete the game entirely
+      if (game.players.length === 0) {
+        delete games[roomId];
+        return;
+      }
+
+      // If host left, transfer host to another player (optional)
+      if (game.host === playerId) {
+        // Assign host to first remaining player
+        game.host = game.players[0] || null;
+        logAction(roomId, `Host left. New host is ${game.playerNames[game.host] || 'unknown'}`);
+      }
+
+      // Update broadcasts
+      broadcastRoomInfo(roomId);
+      broadcastGameState(roomId);
+    }
   });
 });
 
