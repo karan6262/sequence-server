@@ -397,8 +397,9 @@ io.on('connection', (socket) => {
         // unassigned player
       }
 
-      // If no players left, delete the game entirely
-      if (game.players.length === 0) {
+      // If no human players left, delete the game entirely
+      const humanPlayers = game.players.filter(p => !p.startsWith('bot_'));
+      if (humanPlayers.length === 0) {
         delete games[roomId];
         return;
       }
