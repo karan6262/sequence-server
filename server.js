@@ -98,7 +98,7 @@ function broadcastGameState(roomId) {
     board: game.board, turn: game.turn, activePlayerId: activeId, activePlayerName: activeName,
     winner: game.winner, winningLine: game.winningLine, logs: game.logs, 
     turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted,
-    hostId: game.host 
+    hostId: game.host
   });
 }
 
@@ -276,18 +276,15 @@ io.on('connection', (socket) => {
     broadcastRoomInfo(roomId); broadcastGameState(roomId);
   });
 
-  // NEW: Remove Bot Logic
-  // Paste this right below your socket.on('add_bot', ...) block
-
+  // --- THIS IS THE REMOVE BOT LOGIC ---
   socket.on('remove_bot', (data) => {
     const { roomId, teamColor } = data;
     const game = games[roomId];
-    if (!game || game.isGameStarted) return; // Cannot remove once game starts
+    if (!game || game.isGameStarted) return; 
 
     const teamRoster = game.teamRosters[teamColor];
     let botIdToRemove = null;
     
-    // Find the last added bot in the array
     for (let i = teamRoster.length - 1; i >= 0; i--) {
       if (teamRoster[i].startsWith('bot_')) {
         botIdToRemove = teamRoster[i];
@@ -296,7 +293,6 @@ io.on('connection', (socket) => {
     }
 
     if (botIdToRemove) {
-      // Remove bot from the game data
       game.players = game.players.filter(p => p !== botIdToRemove);
       game.teamRosters[teamColor] = teamRoster.filter(p => p !== botIdToRemove);
       
@@ -305,14 +301,12 @@ io.on('connection', (socket) => {
       delete game.teamMap[botIdToRemove];
       delete game.hands[botIdToRemove];
 
-      // Broadcast the update to all players
       logAction(roomId, `${botName} was removed from ${teamColor.toUpperCase()}`);
       broadcastRoomInfo(roomId); 
       broadcastGameState(roomId);
     }
   });
 
-  // It should be placed right above your socket.on('start_game', ...) block
   socket.on('start_game', (roomId) => {
     const game = games[roomId];
     if (!game || game.isGameStarted) return;
