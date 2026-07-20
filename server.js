@@ -98,7 +98,7 @@ function broadcastGameState(roomId) {
     board: game.board, turn: game.turn, activePlayerId: activeId, activePlayerName: activeName,
     winner: game.winner, winningLine: game.winningLine, logs: game.logs, 
     turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted,
-    hostId: game.host // NEW: Sending the host ID to frontend
+    hostId: game.host 
   });
 }
 
@@ -134,15 +134,11 @@ function executeMove(roomId, playerId, index, playedCard, teamColor) {
     const pName = game.playerNames[playerId];
     if (isOneEyed) logAction(roomId, `${pName} removed a chip with ${playedCard}`);
     else logAction(roomId, `${pName} played ${playedCard}`);
-
-    // In sequence-server/server.js -> socket.on('place_chip', ...)
       
     const winLine = checkWin(game.board, teamColor);
     if (winLine) {
         game.winner = teamColor;
         game.winningLine = winLine;
-        // The fix is the REMOVAL of this line:
-        // game.isGameStarted = false; 
         logAction(roomId, `${teamColor.toUpperCase()} TEAM WINS!`);
       } else {
         advanceTurn(roomId);
@@ -212,11 +208,11 @@ io.on('connection', (socket) => {
     const { roomId, playerName, playerId, avatar } = data;
     socket.join(roomId);
     socket.playerId = playerId;
-    socket.roomId = roomId; // store room id for disconnect handling
+    socket.roomId = roomId; 
 
     if (!games[roomId]) {
       games[roomId] = {
-        host: playerId, // NEW: The first creator is the Host
+        host: playerId, 
         board: Array(100).fill(null), turn: 'red', players: [], teamMap: {}, playerNames: {},
         teamRosters: { red: [], blue: [], green: [] }, teamTurnIndex: { red: 0, blue: 0, green: 0 },
         deck: generateShuffledDeck(), hands: {}, winner: null, winningLine: [], logs: [],
@@ -278,6 +274,38 @@ io.on('connection', (socket) => {
 
     logAction(roomId, `${game.playerNames[botId]} was deployed to ${teamColor.toUpperCase()}`);
     broadcastRoomInfo(roomId); broadcastGameState(roomId);
+  });
+
+  // NEW: Remove Bot Logic
+  socket.on('remove_bot', (data) => {
+    const { roomId, teamColor } = data;
+    const game = games[roomId];
+    if (!game || game.isGameStarted) return; // Cannot remove once game starts
+
+    const teamRoster = game.teamRosters[teamColor];
+    let botIdToRemove = null;
+    
+    // Find the last added bot in the array
+    for (let i = teamRoster.length - 1; i >= 0; i--) {
+      if (teamRoster[i].startsWith('bot_')) {
+        botIdToRemove = teamRoster[i];
+        break;
+      }
+    }
+
+    if (botIdToRemove) {
+      game.players = game.players.filter(p => p !== botIdToRemove);
+      game.teamRosters[teamColor] = teamRoster.filter(p => p !== botIdToRemove);
+      
+      const botName = game.playerNames[botIdToRemove];
+      delete game.playerNames[botIdToRemove];
+      delete game.teamMap[botIdToRemove];
+      delete game.hands[botIdToRemove];
+
+      logAction(roomId, `${botName} was removed from ${teamColor.toUpperCase()}`);
+      broadcastRoomInfo(roomId); 
+      broadcastGameState(roomId);
+    }
   });
 
   socket.on('start_game', (roomId) => {
@@ -380,7 +408,6 @@ io.on('connection', (socket) => {
     const game = games[roomId];
     if (!game) return;
 
-    // Remove player from game
     const playerIndex = game.players.indexOf(playerId);
     if (playerIndex !== -1) {
       game.players.splice(playerIndex, 1);
@@ -393,25 +420,19 @@ io.on('connection', (socket) => {
           game.teamRosters[team].splice(teamIndex, 1);
         }
         delete game.hands[playerId];
-      } else {
-        // unassigned player
       }
 
-      // If no human players left, delete the game entirely
       const humanPlayers = game.players.filter(p => !p.startsWith('bot_'));
       if (humanPlayers.length === 0) {
         delete games[roomId];
         return;
       }
 
-      // If host left, transfer host to another player (optional)
       if (game.host === playerId) {
-        // Assign host to first remaining player
         game.host = game.players[0] || null;
         logAction(roomId, `Host left. New host is ${game.playerNames[game.host] || 'unknown'}`);
       }
 
-      // Update broadcasts
       broadcastRoomInfo(roomId);
       broadcastGameState(roomId);
     }
