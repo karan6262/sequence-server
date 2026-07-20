@@ -98,7 +98,7 @@ function broadcastGameState(roomId) {
     board: game.board, turn: game.turn, activePlayerId: activeId, activePlayerName: activeName,
     winner: game.winner, winningLine: game.winningLine, logs: game.logs, 
     turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted,
-    hostId: game.host
+    hostId: game.host, lastMoveIndex: game.lastMoveIndex // NEW: Tracking last move
   });
 }
 
@@ -131,6 +131,8 @@ function executeMove(roomId, playerId, index, playedCard, teamColor) {
   }
 
   if (validMove) {
+    game.lastMoveIndex = index; // Register last move
+
     const pName = game.playerNames[playerId];
     if (isOneEyed) logAction(roomId, `${pName} removed a chip with ${playedCard}`);
     else logAction(roomId, `${pName} played ${playedCard}`);
@@ -154,6 +156,39 @@ function executeMove(roomId, playerId, index, playedCard, teamColor) {
   return false;
 }
 
+// --- NEW SMARTER BOT AI LOGIC ---
+function countNeighbors(board, index, targetTeam) {
+  let count = 0;
+  const r = Math.floor(index / 10);
+  const c = index % 10;
+  const dirs = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
+  for(let [dr, dc] of dirs) {
+    let nr = r + dr, nc = c + dc;
+    if (nr >= 0 && nr <= 9 && nc >= 0 && nc <= 9) {
+      let nIdx = nr * 10 + nc;
+      let val = board[nIdx];
+      if (val === targetTeam || BOARD_LAYOUT[nIdx] === 'FREE') count++;
+    }
+  }
+  return count;
+}
+
+function getMoveScore(board, index, teamColor, isRemoval) {
+  if (isRemoval) {
+    // If removing, target enemy chips that are clustered together (higher threat)
+    return countNeighbors(board, index, board[index]) * 10 + 50 + Math.random();
+  } else {
+    // If placing, test if it's a winning move
+    board[index] = teamColor;
+    let winLine = checkWin(board, teamColor);
+    board[index] = null; // Revert test
+    if (winLine) return 10000; // Prioritize winning above all else
+
+    // Score based on how many friendly chips are nearby to build a sequence
+    return countNeighbors(board, index, teamColor) * 10 + Math.random();
+  }
+}
+
 function triggerBotTurn(roomId) {
   const game = games[roomId];
   if (!game || !game.isGameStarted || game.winner) return;
@@ -166,42 +201,48 @@ function triggerBotTurn(roomId) {
 
     const hand = game.hands[activeId];
     const teamColor = game.turn;
-    let moved = false;
+    
+    let bestMove = null;
+    let bestScore = -1;
 
+    // Evaluate ALL possible moves across entire hand to find the highest scoring one
     for (let card of hand) {
-      if (card.includes('J')) continue;
-      let validIndices = BOARD_LAYOUT.map((val, idx) => val === card ? idx : -1).filter(idx => idx !== -1 && game.board[idx] === null);
-      if (validIndices.length > 0) {
-        moved = executeMove(roomId, activeId, validIndices[0], card, teamColor);
-        if (moved) break;
+      const isTwoEyed = card === 'J♦' || card === 'J♣';
+      const isOneEyed = card === 'J♠' || card === 'J♥';
+
+      if (isTwoEyed) {
+         let validIndices = game.board.map((v, i) => v === null && BOARD_LAYOUT[i] !== 'FREE' ? i : -1).filter(i => i !== -1);
+         for (let idx of validIndices) {
+            let score = getMoveScore(game.board, idx, teamColor, false);
+            if (score > bestScore) { bestScore = score; bestMove = { idx, card }; }
+         }
+      } else if (isOneEyed) {
+         let validIndices = game.board.map((v, i) => v !== null && v !== teamColor && BOARD_LAYOUT[i] !== 'FREE' ? i : -1).filter(i => i !== -1);
+         for (let idx of validIndices) {
+            let score = getMoveScore(game.board, idx, teamColor, true);
+            if (score > bestScore) { bestScore = score; bestMove = { idx, card }; }
+         }
+      } else {
+         let validIndices = BOARD_LAYOUT.map((val, idx) => val === card ? idx : -1).filter(idx => idx !== -1 && game.board[idx] === null);
+         for (let idx of validIndices) {
+            let score = getMoveScore(game.board, idx, teamColor, false);
+            if (score > bestScore) { bestScore = score; bestMove = { idx, card }; }
+         }
       }
     }
 
-    if (!moved) {
-      const twoEyed = hand.find(c => c === 'J♦' || c === 'J♣');
-      if (twoEyed) {
-        let emptyIdx = game.board.findIndex((val, idx) => val === null && BOARD_LAYOUT[idx] !== 'FREE');
-        if (emptyIdx !== -1) moved = executeMove(roomId, activeId, emptyIdx, twoEyed, teamColor);
-      }
-    }
-
-    if (!moved) {
-      const oneEyed = hand.find(c => c === 'J♠' || c === 'J♥');
-      if (oneEyed) {
-        let oppIdx = game.board.findIndex((val, idx) => val !== null && val !== teamColor && BOARD_LAYOUT[idx] !== 'FREE');
-        if (oppIdx !== -1) moved = executeMove(roomId, activeId, oppIdx, oneEyed, teamColor);
-      }
-    }
-
-    if (!moved) {
+    if (bestMove) {
+      executeMove(roomId, activeId, bestMove.idx, bestMove.card, teamColor);
+    } else {
       logAction(roomId, `${game.playerNames[activeId]} had no valid moves and skipped.`);
       advanceTurn(roomId);
     }
     
     io.to(roomId).emit('bot_played');
     broadcastGameState(roomId);
-  }, 2000); 
+  }, 2000); // 2 second thinking delay for bots
 }
+// ------------------------------------
 
 io.on('connection', (socket) => {
   socket.on('join_room', (data) => {
@@ -216,7 +257,7 @@ io.on('connection', (socket) => {
         board: Array(100).fill(null), turn: 'red', players: [], teamMap: {}, playerNames: {},
         teamRosters: { red: [], blue: [], green: [] }, teamTurnIndex: { red: 0, blue: 0, green: 0 },
         deck: generateShuffledDeck(), hands: {}, winner: null, winningLine: [], logs: [],
-        turnDeadline: null, isGameStarted: false
+        turnDeadline: null, isGameStarted: false, lastMoveIndex: null
       };
       logAction(roomId, "Room created.");
     }
@@ -276,7 +317,6 @@ io.on('connection', (socket) => {
     broadcastRoomInfo(roomId); broadcastGameState(roomId);
   });
 
-  // --- THIS IS THE REMOVE BOT LOGIC ---
   socket.on('remove_bot', (data) => {
     const { roomId, teamColor } = data;
     const game = games[roomId];
@@ -389,7 +429,7 @@ io.on('connection', (socket) => {
 
     game.board = Array(100).fill(null); game.winner = null; game.winningLine = [];
     game.deck = generateShuffledDeck(); game.teamTurnIndex = { red: 0, blue: 0, green: 0 };
-    game.turnDeadline = null; game.isGameStarted = false;
+    game.turnDeadline = null; game.isGameStarted = false; game.lastMoveIndex = null;
 
     logAction(roomId, "Game Restarted. Waiting to begin...");
     game.players.forEach(pid => {
