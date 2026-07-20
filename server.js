@@ -277,6 +277,8 @@ io.on('connection', (socket) => {
   });
 
   // NEW: Remove Bot Logic
+  // Paste this right below your socket.on('add_bot', ...) block
+
   socket.on('remove_bot', (data) => {
     const { roomId, teamColor } = data;
     const game = games[roomId];
@@ -294,6 +296,7 @@ io.on('connection', (socket) => {
     }
 
     if (botIdToRemove) {
+      // Remove bot from the game data
       game.players = game.players.filter(p => p !== botIdToRemove);
       game.teamRosters[teamColor] = teamRoster.filter(p => p !== botIdToRemove);
       
@@ -302,12 +305,14 @@ io.on('connection', (socket) => {
       delete game.teamMap[botIdToRemove];
       delete game.hands[botIdToRemove];
 
+      // Broadcast the update to all players
       logAction(roomId, `${botName} was removed from ${teamColor.toUpperCase()}`);
       broadcastRoomInfo(roomId); 
       broadcastGameState(roomId);
     }
   });
 
+  // It should be placed right above your socket.on('start_game', ...) block
   socket.on('start_game', (roomId) => {
     const game = games[roomId];
     if (!game || game.isGameStarted) return;
