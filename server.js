@@ -82,8 +82,22 @@ function logAction(roomId, message) {
 
 function advanceTurn(roomId) {
   const game = games[roomId];
-  game.teamTurnIndex[game.turn] = (game.teamTurnIndex[game.turn] + 1) % game.teamRosters[game.turn].length;
-  game.turn = getNextTeam(game.turn, game.teamRosters);
+  let currentTeam = game.turn;
+
+  // Safely increment turn index avoiding division by zero crash
+  if (game.teamRosters[currentTeam].length > 0) {
+    game.teamTurnIndex[currentTeam] = (game.teamTurnIndex[currentTeam] + 1) % game.teamRosters[currentTeam].length;
+  }
+
+  game.turn = getNextTeam(currentTeam, game.teamRosters);
+
+  // Safety catch to ensure new team's index is within bounds
+  if (game.teamRosters[game.turn].length > 0) {
+    if (game.teamTurnIndex[game.turn] >= game.teamRosters[game.turn].length) {
+      game.teamTurnIndex[game.turn] = 0;
+    }
+  }
+
   game.turnDeadline = Date.now() + 60000; 
   triggerBotTurn(roomId);
 }
@@ -98,7 +112,7 @@ function broadcastGameState(roomId) {
     board: game.board, turn: game.turn, activePlayerId: activeId, activePlayerName: activeName,
     winner: game.winner, winningLine: game.winningLine, logs: game.logs, 
     turnDeadline: game.turnDeadline, isGameStarted: game.isGameStarted,
-    hostId: game.host, lastMoveIndex: game.lastMoveIndex // NEW: Tracking last move
+    hostId: game.host, lastMoveIndex: game.lastMoveIndex 
   });
 }
 
@@ -131,7 +145,7 @@ function executeMove(roomId, playerId, index, playedCard, teamColor) {
   }
 
   if (validMove) {
-    game.lastMoveIndex = index; // Register last move
+    game.lastMoveIndex = index;
 
     const pName = game.playerNames[playerId];
     if (isOneEyed) logAction(roomId, `${pName} removed a chip with ${playedCard}`);
@@ -156,7 +170,6 @@ function executeMove(roomId, playerId, index, playedCard, teamColor) {
   return false;
 }
 
-// --- NEW SMARTER BOT AI LOGIC ---
 function countNeighbors(board, index, targetTeam) {
   let count = 0;
   const r = Math.floor(index / 10);
@@ -175,16 +188,12 @@ function countNeighbors(board, index, targetTeam) {
 
 function getMoveScore(board, index, teamColor, isRemoval) {
   if (isRemoval) {
-    // If removing, target enemy chips that are clustered together (higher threat)
     return countNeighbors(board, index, board[index]) * 10 + 50 + Math.random();
   } else {
-    // If placing, test if it's a winning move
     board[index] = teamColor;
     let winLine = checkWin(board, teamColor);
-    board[index] = null; // Revert test
-    if (winLine) return 10000; // Prioritize winning above all else
-
-    // Score based on how many friendly chips are nearby to build a sequence
+    board[index] = null; 
+    if (winLine) return 10000;
     return countNeighbors(board, index, teamColor) * 10 + Math.random();
   }
 }
@@ -205,7 +214,6 @@ function triggerBotTurn(roomId) {
     let bestMove = null;
     let bestScore = -1;
 
-    // Evaluate ALL possible moves across entire hand to find the highest scoring one
     for (let card of hand) {
       const isTwoEyed = card === 'J♦' || card === 'J♣';
       const isOneEyed = card === 'J♠' || card === 'J♥';
@@ -240,9 +248,8 @@ function triggerBotTurn(roomId) {
     
     io.to(roomId).emit('bot_played');
     broadcastGameState(roomId);
-  }, 2000); // 2 second thinking delay for bots
+  }, 2000); 
 }
-// ------------------------------------
 
 io.on('connection', (socket) => {
   socket.on('join_room', (data) => {
@@ -374,16 +381,20 @@ io.on('connection', (socket) => {
     if (game) io.to(roomId).emit('chat_message', { name: game.playerNames[playerId], team: game.teamMap[playerId], msg });
   });
 
+  // NEW: Any client can trigger timeout skip if server time says it is expired
   socket.on('timeout_skip', (data) => {
-    const { roomId, playerId } = data;
+    const { roomId } = data;
     const game = games[roomId];
-    if (!game || game.winner || !game.isGameStarted) return;
-    const expectedId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
-    if (playerId !== expectedId || Date.now() < game.turnDeadline) return;
-
-    logAction(roomId, `${game.playerNames[playerId]} ran out of time! Turn skipped.`);
-    advanceTurn(roomId);
-    broadcastGameState(roomId);
+    if (!game || game.winner || !game.isGameStarted || !game.turnDeadline) return;
+    
+    // Add 2 second buffer to allow natural network delays before forced skip
+    if (Date.now() > game.turnDeadline + 2000) {
+      const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]];
+      const missedName = activeId ? game.playerNames[activeId] : 'A player';
+      logAction(roomId, `${missedName} ran out of time! Turn skipped.`);
+      advanceTurn(roomId);
+      broadcastGameState(roomId);
+    }
   });
 
   socket.on('trade_dead_card', (data) => {
@@ -449,8 +460,12 @@ io.on('connection', (socket) => {
 
     const playerIndex = game.players.indexOf(playerId);
     if (playerIndex !== -1) {
+      // Check if it was their turn BEFORE we remove them
+      const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]];
+      const wasMyTurn = (activeId === playerId);
+
       game.players.splice(playerIndex, 1);
-      delete game.playerNames[playerId];
+      
       const team = game.teamMap[playerId];
       if (team) {
         delete game.teamMap[playerId];
@@ -470,6 +485,15 @@ io.on('connection', (socket) => {
       if (game.host === playerId) {
         game.host = game.players[0] || null;
         logAction(roomId, `Host left. New host is ${game.playerNames[game.host] || 'unknown'}`);
+      }
+      
+      const pName = game.playerNames[playerId] || 'A player';
+      delete game.playerNames[playerId];
+
+      // Auto-advance turn if they abandoned the game while active
+      if (wasMyTurn && game.isGameStarted && !game.winner) {
+        logAction(roomId, `${pName} disconnected during their turn.`);
+        advanceTurn(roomId);
       }
 
       broadcastRoomInfo(roomId);
