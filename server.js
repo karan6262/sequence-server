@@ -379,7 +379,6 @@ io.on('connection', (socket) => {
     if (game) io.to(roomId).emit('chat_message', { name: game.playerNames[playerId], team: game.teamMap[playerId], msg });
   });
 
-  // --- NEW: Emote Broadcaster ---
   socket.on('send_emote', (data) => {
     const { roomId, name, emote } = data;
     io.to(roomId).emit('receive_emote', { name, emote });
@@ -390,7 +389,8 @@ io.on('connection', (socket) => {
     const game = games[roomId];
     if (!game || game.winner || !game.isGameStarted || !game.turnDeadline) return;
     
-    if (Date.now() > game.turnDeadline + 2000) {
+    // STRICT FIX: No grace buffer. If the time is up, skip immediately.
+    if (Date.now() >= game.turnDeadline) {
       const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]];
       const missedName = activeId ? game.playerNames[activeId] : 'A player';
       logAction(roomId, `${missedName} ran out of time! Turn skipped.`);
@@ -406,6 +406,9 @@ io.on('connection', (socket) => {
     
     const expectedId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
     if (playerId !== expectedId) return; 
+
+    // STRICT FIX: Reject move if time ran out
+    if (game.turnDeadline && Date.now() >= game.turnDeadline) return;
 
     const indices = BOARD_LAYOUT.map((c, i) => c === deadCard ? i : -1).filter(i => i !== -1);
     const isDead = indices.every(i => game.board[i] !== null);
@@ -429,6 +432,9 @@ io.on('connection', (socket) => {
 
     const expectedId = game.teamRosters[game.turn][game.teamTurnIndex[game.turn]];
     if (playerId !== expectedId) return; 
+
+    // STRICT FIX: Reject move if time ran out
+    if (game.turnDeadline && Date.now() >= game.turnDeadline) return;
 
     if (executeMove(roomId, playerId, index, playedCard, teamColor)) {
       socket.emit('your_hand', game.hands[playerId] || []);
