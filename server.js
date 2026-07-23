@@ -84,14 +84,12 @@ function advanceTurn(roomId) {
   const game = games[roomId];
   let currentTeam = game.turn;
 
-  // Safely increment turn index avoiding division by zero crash
   if (game.teamRosters[currentTeam].length > 0) {
     game.teamTurnIndex[currentTeam] = (game.teamTurnIndex[currentTeam] + 1) % game.teamRosters[currentTeam].length;
   }
 
   game.turn = getNextTeam(currentTeam, game.teamRosters);
 
-  // Safety catch to ensure new team's index is within bounds
   if (game.teamRosters[game.turn].length > 0) {
     if (game.teamTurnIndex[game.turn] >= game.teamRosters[game.turn].length) {
       game.teamTurnIndex[game.turn] = 0;
@@ -381,13 +379,17 @@ io.on('connection', (socket) => {
     if (game) io.to(roomId).emit('chat_message', { name: game.playerNames[playerId], team: game.teamMap[playerId], msg });
   });
 
-  // NEW: Any client can trigger timeout skip if server time says it is expired
+  // --- NEW: Emote Broadcaster ---
+  socket.on('send_emote', (data) => {
+    const { roomId, name, emote } = data;
+    io.to(roomId).emit('receive_emote', { name, emote });
+  });
+
   socket.on('timeout_skip', (data) => {
     const { roomId } = data;
     const game = games[roomId];
     if (!game || game.winner || !game.isGameStarted || !game.turnDeadline) return;
     
-    // Add 2 second buffer to allow natural network delays before forced skip
     if (Date.now() > game.turnDeadline + 2000) {
       const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]];
       const missedName = activeId ? game.playerNames[activeId] : 'A player';
@@ -460,7 +462,6 @@ io.on('connection', (socket) => {
 
     const playerIndex = game.players.indexOf(playerId);
     if (playerIndex !== -1) {
-      // Check if it was their turn BEFORE we remove them
       const activeId = game.teamRosters[game.turn]?.[game.teamTurnIndex[game.turn]];
       const wasMyTurn = (activeId === playerId);
 
@@ -490,7 +491,6 @@ io.on('connection', (socket) => {
       const pName = game.playerNames[playerId] || 'A player';
       delete game.playerNames[playerId];
 
-      // Auto-advance turn if they abandoned the game while active
       if (wasMyTurn && game.isGameStarted && !game.winner) {
         logAction(roomId, `${pName} disconnected during their turn.`);
         advanceTurn(roomId);
